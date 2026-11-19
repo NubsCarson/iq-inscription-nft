@@ -8,6 +8,56 @@
   },
   "instructions": [
     {
+      "name": "assert_mint_price",
+      "discriminator": [
+        250,
+        244,
+        155,
+        86,
+        165,
+        168,
+        147,
+        192
+      ],
+      "accounts": [
+        {
+          "name": "registry",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "registry.collection",
+                "account": "Registry"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "expected_currency",
+          "type": "pubkey"
+        },
+        {
+          "name": "expected_price",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "initialize_registry",
       "discriminator": [
         189,
@@ -1119,6 +1169,11 @@
       "code": 6017,
       "name": "AlreadyMigratedOrBad",
       "msg": "registry is already migrated or has an unexpected size"
+    },
+    {
+      "code": 6018,
+      "name": "MintPriceChanged",
+      "msg": "mint price changed after the buyer reviewed the quote"
     }
   ],
   "types": [

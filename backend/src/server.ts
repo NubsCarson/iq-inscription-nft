@@ -8,7 +8,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { PublicKey, Connection } from "@solana/web3.js";
 import { config } from "./config.ts";
 import { rarityOf } from "./rarity.ts";
-import { db, nowSec } from "./db.ts";
+import { db, nowSec, type CollectionRow } from "./db.ts";
 import { getCollection, getItem, heldBy, listCollections, mintedIndices, publicView } from "./collections.ts";
 import { reserve, ReserveError } from "./allocator.ts";
 import { getReservation, markAwaitingSubmit, markCancelled, markLanded, markRejected, touchReservation } from "./reservations.ts";
@@ -23,6 +23,7 @@ import { reap } from "./reaper.ts";
 import { startTensorPoller, recentSales, activeListings, recentListings, tensorDiag } from "./tensor.ts";
 import { buildListTx, buildBuyTx, buildDelistTx } from "./tensor-trade.ts";
 import { poolStats } from "./rpcpool.ts";
+import { quoteStockPayment, StockSwapError, stockSolEnabled, stockSolMints, supportsStockSol } from "./stock-swap.ts";
 
 export const app = new Hono();
 app.use(
@@ -71,6 +72,31 @@ app.get("/c/:slug", (c) => {
   const col = getCollection(c.req.param("slug"));
   if (!col) return c.json({ error: "not found" }, 404);
   return c.json({ ...publicView(col), mintedIndices: mintedIndices(col.slug) });
+});
+
+// Recheck chain terms before quoting or co-signing any stock-priced mint.
+async function verifiedStockRegistry(col: CollectionRow) {
+  const registry = await fetchRegistry(new PublicKey(col.registry))
+    .catch(() => { throw new StockSwapError("registry unavailable, retry", 503); });
+  if (registry.currency !== col.currency_mint || registry.priceLamports !== col.price_lamports ||
+      registry.treasury !== col.treasury || registry.depositLamports !== 0)
+    throw new StockSwapError("Mint terms changed on chain. Checkout is paused until the collection is updated.");
+  return registry;
+}
+
+app.get("/c/:slug/pay-with-sol/quote", async (c) => {
+  c.header("Cache-Control", "no-store");
+  if (!stockSolEnabled) return c.json({ error: "Pay with SOL is unavailable for this collection." }, 422);
+  const wallet = c.req.query("wallet");
+  if (!isPubkey(wallet)) return c.json({ error: "A valid buyer wallet is required." }, 422);
+  const col = getCollection(c.req.param("slug"));
+  if (!col || !supportsStockSol(col.currency_mint) || !isAllowedCurrency(col.currency_mint ?? "SOL"))
+    return c.json({ error: "Pay with SOL is unavailable for this collection." }, 422);
+  if (rateLimited("stock-quote:" + clientIp(c))) return c.json({ error: "Stock quote rate limited, try again shortly." }, 503);
+  const registry = await verifiedStockRegistry(col);
+  if (registry.frozen || registry.minted >= registry.maxSupply)
+    return c.json({ error: "This collection is unavailable for minting." }, 422);
+  return c.json({ payWithSol: await quoteStockPayment(new PublicKey(wallet), new PublicKey(registry.currency), registry.priceLamports) });
 });
 
 // Items are public before mint (the images sit on Arweave), so the page can
@@ -162,6 +188,7 @@ app.post("/c/:slug/mint", async (c) => {
   if (!col) return c.json({ error: "not found" }, 404);
   const body = await c.req.json().catch(() => ({}));
   const { reservationId, inscriptionSig, metaSig, asset } = body ?? {};
+  const payWithSol = body?.payWithSol === true;
   if (typeof reservationId !== "string") return c.json({ error: "reservationId required" }, 400);
   const r = getReservation(reservationId);
   if (!r || r.slug !== col.slug) return c.json({ error: "reservation not found" }, 404);
@@ -170,22 +197,17 @@ app.post("/c/:slug/mint", async (c) => {
 
   if (r.state === "confirmed") return c.json({ status: "confirmed", index: r.item_index });
   if (!isAllowedCurrency(col.currency_mint ?? "SOL")) return c.json({ error: "currency not available" }, 403);
+  if (payWithSol && !supportsStockSol(col.currency_mint))
+    return c.json({ error: "Pay with SOL is unavailable for this collection." }, 422);
+  if (payWithSol && rateLimited(clientIp(c))) return c.json({ error: "rate limited" }, 429);
   if (r.state !== "reserved" && r.state !== "awaiting_submit") return c.json({ error: `reservation is ${r.state}` }, 409);
   if (r.expires_at < nowSec()) return c.json({ error: "reservation expired" }, 409);
 
-  if (!isSol(col.currency_mint)) {
-    let registry;
-    try { registry = await fetchRegistry(new PublicKey(col.registry)); }
-    catch { return c.json({ error: "registry unavailable, retry" }, 503); }
-    if (registry.currency !== col.currency_mint || registry.priceLamports !== col.price_lamports ||
-        registry.treasury !== col.treasury || registry.depositLamports !== 0) {
-      return c.json({ error: "Mint terms changed on chain. Checkout is paused until the collection is updated." }, 422);
-    }
-  }
+  if (!isSol(col.currency_mint)) await verifiedStockRegistry(col);
 
   // Replay: already verified, re-issue with a fresh blockhash. No new verification.
   if (r.state === "awaiting_submit") {
-    const co = await coSignRegisterItem(col, item, r, r.inscription_sig!, r.meta_sig!, r.asset!);
+    const co = await coSignRegisterItem(col, item, r, r.inscription_sig!, r.meta_sig!, r.asset!, payWithSol);
     console.log(`${tag} path=replay ${Date.now() - t0}ms`);
     return c.json({ ...co, index: r.item_index, replay: true });
   }
@@ -207,7 +229,7 @@ app.post("/c/:slug/mint", async (c) => {
     return c.json({ error: "verification failed", reason: result.reason }, 400);
   }
   markAwaitingSubmit(r.id, inscriptionSig, metaSig, asset);
-  const co = await coSignRegisterItem(col, item, r, inscriptionSig, metaSig, asset);
+  const co = await coSignRegisterItem(col, item, r, inscriptionSig, metaSig, asset, payWithSol);
   console.log(`${tag} path=first verify=${Date.now() - tv}ms total=${Date.now() - t0}ms`);
   return c.json({ ...co, index: r.item_index });
 });
@@ -316,6 +338,7 @@ const lightItems = (items: StageItem[]) => items.map((it) => ({ ...it, bytes: Bu
 app.get("/creator/currencies", (c) => c.json({
   currencies: STOCK_CURRENCIES.filter(({ mint }) => isAllowedCurrency(mint)),
   checkout: "wallet-v1",
+  ...(stockSolEnabled ? { payWithSol: true, payWithSolMints: stockSolMints } : {}),
 }));
 
 app.post("/creator/stage", async (c) => {

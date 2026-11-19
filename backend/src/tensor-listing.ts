@@ -1,12 +1,30 @@
 import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
-import { MPL_CORE } from "./config.ts";
-import { currencyList, SOL_INFO } from "./currencies.ts";
+import { config, MPL_CORE } from "./config.ts";
+import { currencyList, SOL_INFO, TOKEN_2022_PROGRAM } from "./currencies.ts";
 import { withConnection } from "./rpcpool.ts";
 
 const TENSOR = new PublicKey("TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp");
 // Layout from Tensor Marketplace v1's generated ListState account codec.
 const LIST_STATE = Buffer.from([78, 242, 89, 138, 161, 221, 176, 75]);
 const approvedCurrency = new Map(currencyList().map(info => [info.mint, info]));
+const NVDA_X = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh";
+
+export function supportsLocalTensorCurrency(currency: string) {
+  return currency === "SOL" || (config.stockEnabled && currency === NVDA_X);
+}
+
+export async function readLocalTensorCurrency(currency: string) {
+  if (currency === "SOL") return SOL_INFO;
+  if (!supportsLocalTensorCurrency(currency)) return null;
+  const info = approvedCurrency.get(currency);
+  const mint = await withConnection(rpc => rpc.getAccountInfo(new PublicKey(currency), "confirmed"));
+  // Token-2022 uses the regular 82-byte Mint layout. An extended mint adds
+  // padding, an AccountType::Mint byte at offset 165, and its extensions.
+  if (!info || !mint?.owner.equals(TOKEN_2022_PROGRAM) ||
+      !(mint.data.length === 82 || (mint.data.length >= 166 && mint.data[165] === 1)) ||
+      mint.data[44] !== info.decimals || mint.data[45] !== 1) return null;
+  return info;
+}
 
 function decodeListing(data: Buffer, mint: PublicKey, bump: number) {
   if (data.length < 221 || !data.subarray(0, 8).equals(LIST_STATE) ||
@@ -66,12 +84,13 @@ export async function readCoreTensorMarket(mintAddress: string) {
   const expired = expiry < clock.data.readBigInt64LE(32);
   const orderAddress = order.toBase58();
   const { currency, privateTaker, cosigner } = terms;
+  const currencyInfo = await readLocalTensorCurrency(currency);
   return {
     currentOwner,
     listing: {
       ...terms, order: orderAddress, mint: mint.toBase58(), expiry: expiry.toString(), expired,
-      currencyInfo: currency === "SOL" ? SOL_INFO : approvedCurrency.get(currency) ?? null,
-      buySupported: !expired && currentOwner === orderAddress && currency === "SOL" && !privateTaker && !cosigner,
+      currencyInfo: currencyInfo ?? approvedCurrency.get(currency) ?? null,
+      buySupported: !expired && currentOwner === orderAddress && Boolean(currencyInfo) && !privateTaker && !cosigner,
     }
   };
 }

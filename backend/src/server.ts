@@ -22,7 +22,7 @@ import { reconcile, type ReconcileReport } from "./reconciler.ts";
 import { reap } from "./reaper.ts";
 import { startTensorPoller, recentSales, activeListings, recentListings, tensorDiag } from "./tensor.ts";
 import { buildListTx, buildBuyTx, buildDelistTx } from "./tensor-trade.ts";
-import { readCoreTensorMarket } from "./tensor-listing.ts";
+import { readCoreTensorMarket, readLocalTensorCurrency, supportsLocalTensorCurrency } from "./tensor-listing.ts";
 import { poolStats } from "./rpcpool.ts";
 
 export const app = new Hono();
@@ -562,8 +562,10 @@ app.post("/market/list", async (c) => {
   if (!isAllowedCurrency(currency)) return c.json({ error: "currency not available", currency }, 403);
   try {
     if (config.tensorLocal) {
-      if (!Number.isSafeInteger(price) || !isSol(currency)) {
-        return c.json({ error: "Local listing requires an exact SOL amount." }, 422);
+      if (typeof b.price !== "number" || !Number.isSafeInteger(price) ||
+          (b.currency != null && typeof b.currency !== "string") ||
+          !await readLocalTensorCurrency(isSol(currency) ? "SOL" : currency)) {
+        return c.json({ error: "Local listing requires an exact amount in SOL or verified NVDAx." }, 422);
       }
       const { currentOwner, listing } = await readCoreTensorMarket(b.mint);
       if (currentOwner !== b.owner || listing) return c.json({ error: "The owner or listing changed." }, 409);
@@ -583,12 +585,16 @@ app.post("/market/buy", async (c) => {
   if (!isAllowedCurrency(currency)) return c.json({ error: "currency not available", currency }, 403);
   try {
     if (config.tensorLocal) {
-      if (!Number.isSafeInteger(maxPrice) || !isSol(currency) || b.owner === b.buyer) {
-        return c.json({ error: "Local buy requires an exact SOL cap and a different buyer." }, 422);
+      const requestedCurrency = isSol(currency) ? "SOL" : currency;
+      if (typeof b.maxPrice !== "number" || !Number.isSafeInteger(maxPrice) ||
+          (b.currency != null && typeof b.currency !== "string") ||
+          !supportsLocalTensorCurrency(requestedCurrency) || b.owner === b.buyer) {
+        return c.json({ error: "Local buy requires an exact cap in SOL or NVDAx and a different buyer." }, 422);
       }
       const { listing } = await readCoreTensorMarket(b.mint);
-      if (!listing?.buySupported || listing.owner !== b.owner || BigInt(listing.price) > BigInt(maxPrice)) {
-        return c.json({ error: "The verified SOL listing no longer matches the purchase." }, 409);
+      if (!listing?.buySupported || listing.owner !== b.owner ||
+          listing.currency !== requestedCurrency || BigInt(listing.price) > BigInt(maxPrice)) {
+        return c.json({ error: "The verified listing currency, seller, or price no longer matches the purchase." }, 409);
       }
     }
     return c.json(await buildBuyTx({ mint: b.mint, buyer: b.buyer, owner: b.owner, maxPrice, currency }));
@@ -603,9 +609,9 @@ app.post("/market/delist", async (c) => {
   try {
     if (config.tensorLocal) {
       const { currentOwner, listing } = await readCoreTensorMarket(b.mint);
-      if (!listing || currentOwner !== listing.order || listing.owner !== b.owner || listing.currency !== "SOL" ||
-          listing.cosigner) {
-        return c.json({ error: "The verified SOL listing or owner changed." }, 409);
+      if (!listing || currentOwner !== listing.order || listing.owner !== b.owner ||
+          !supportsLocalTensorCurrency(listing.currency) || listing.cosigner) {
+        return c.json({ error: "The verified SOL or NVDAx listing or owner changed." }, 409);
       }
     }
     return c.json(await buildDelistTx({ mint: b.mint, owner: b.owner }));

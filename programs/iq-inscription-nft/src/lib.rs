@@ -288,6 +288,19 @@ pub mod iq_inscription_nft {
         Ok(())
     }
 
+    // A checkout may place this immediately before register_item in the same
+    // transaction to bind its quote to the terms read during execution.
+    pub fn assert_mint_price(
+        ctx: Context<AssertMintPrice>,
+        expected_currency: Pubkey,
+        expected_price: u64,
+    ) -> Result<()> {
+        let registry = &ctx.accounts.registry;
+        require_keys_eq!(registry.currency, expected_currency, ErrorCode::WrongCurrencyMint);
+        require!(registry.price_lamports == expected_price, ErrorCode::MintPriceChanged);
+        Ok(())
+    }
+
     pub fn set_frozen(ctx: Context<AdminOnly>, frozen: bool) -> Result<()> {
         ctx.accounts.registry.frozen = frozen;
         Ok(())
@@ -816,6 +829,12 @@ pub struct RegisterSingle<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AssertMintPrice<'info> {
+    #[account(seeds = [REGISTRY_SEED, registry.collection.as_ref()], bump = registry.bump)]
+    pub registry: Account<'info, Registry>,
+}
+
+#[derive(Accounts)]
 pub struct AdminOnly<'info> {
     pub admin: Signer<'info>,
 
@@ -946,6 +965,8 @@ pub enum ErrorCode {
     BadRegistryLayout,
     #[msg("registry is already migrated or has an unexpected size")]
     AlreadyMigratedOrBad,
+    #[msg("mint price changed after the buyer reviewed the quote")]
+    MintPriceChanged,
 }
 
 #[cfg(test)]

@@ -18,7 +18,10 @@ export type TradeTx = { txV0: string; lastValidBlockHeight: number | null; total
 async function tensorTx(path: string, params: Record<string, string>): Promise<TradeTx> {
   if (!config.tensorApiKey) throw new Error("tensor api key not configured");
   const url = `${config.tensorBase}${path}?${new URLSearchParams(params)}`;
-  const r = await fetch(url, { headers: { "x-tensor-api-key": config.tensorApiKey } });
+  const headers = { "x-tensor-api-key": config.tensorApiKey };
+  const r = await fetch(url, config.tensorLocal
+    ? { headers, redirect: "error", signal: AbortSignal.timeout(7_500) }
+    : { headers });
   const j = await r.json().catch(() => null);
   if (!r.ok) throw new Error((j && (j.message || j.error)) || `tensor ${path} ${r.status}`);
   const t = j?.txs?.[0];

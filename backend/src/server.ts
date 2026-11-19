@@ -22,6 +22,7 @@ import { reconcile, type ReconcileReport } from "./reconciler.ts";
 import { reap } from "./reaper.ts";
 import { startTensorPoller, recentSales, activeListings, recentListings, tensorDiag } from "./tensor.ts";
 import { buildListTx, buildBuyTx, buildDelistTx } from "./tensor-trade.ts";
+import { readCoreTensorMarket } from "./tensor-listing.ts";
 import { poolStats } from "./rpcpool.ts";
 
 export const app = new Hono();
@@ -537,32 +538,78 @@ app.get("/c/:slug/listings", (c) => {
 // treasury is the broker, so our share of Tensor's taker fee comes back. The
 // trade settles on Tensor's program, not ours. A non-SOL currency is gated by
 // STOCK_ENABLED via isAllowedCurrency.
+const localMarketRequest = (url: string) =>
+  ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname);
+
+app.get("/market/listing/:mint", async (c) => {
+  if (!config.tensorLocal || !localMarketRequest(c.req.url)) {
+    return c.json({ error: "Market listing verification is unavailable." }, 404);
+  }
+  const mint = c.req.param("mint");
+  if (!isPubkey(mint)) return c.json({ error: "mint must be a base58 pubkey" }, 400);
+  c.header("Cache-Control", "no-store");
+  try { return c.json(await readCoreTensorMarket(mint)); }
+  catch (e) { return c.json({ error: String((e as Error).message ?? e) }, 422); }
+});
+
 app.post("/market/list", async (c) => {
+  if (config.tensorLocal && !localMarketRequest(c.req.url)) return c.json({ error: "Local market only." }, 403);
   const b = await c.req.json().catch(() => ({}));
   if (!isPubkey(b.mint) || !isPubkey(b.owner)) return c.json({ error: "mint and owner must be base58 pubkeys" }, 400);
   const price = Number(b.price);
   if (!Number.isFinite(price) || price <= 0) return c.json({ error: "price must be a positive number" }, 400);
   const currency = typeof b.currency === "string" && b.currency ? b.currency : "SOL";
   if (!isAllowedCurrency(currency)) return c.json({ error: "currency not available", currency }, 403);
-  try { return c.json(await buildListTx({ mint: b.mint, owner: b.owner, price, currency })); }
+  try {
+    if (config.tensorLocal) {
+      if (!Number.isSafeInteger(price) || !isSol(currency)) {
+        return c.json({ error: "Local listing requires an exact SOL amount." }, 422);
+      }
+      const { currentOwner, listing } = await readCoreTensorMarket(b.mint);
+      if (currentOwner !== b.owner || listing) return c.json({ error: "The owner or listing changed." }, 409);
+    }
+    return c.json(await buildListTx({ mint: b.mint, owner: b.owner, price, currency }));
+  }
   catch (e) { return c.json({ error: String((e as any)?.message ?? e) }, 400); }
 });
 
 app.post("/market/buy", async (c) => {
+  if (config.tensorLocal && !localMarketRequest(c.req.url)) return c.json({ error: "Local market only." }, 403);
   const b = await c.req.json().catch(() => ({}));
   if (!isPubkey(b.mint) || !isPubkey(b.buyer) || !isPubkey(b.owner)) return c.json({ error: "mint, buyer, owner must be base58 pubkeys" }, 400);
   const maxPrice = Number(b.maxPrice);
   if (!Number.isFinite(maxPrice) || maxPrice <= 0) return c.json({ error: "maxPrice must be a positive number" }, 400);
   const currency = typeof b.currency === "string" && b.currency ? b.currency : "SOL";
   if (!isAllowedCurrency(currency)) return c.json({ error: "currency not available", currency }, 403);
-  try { return c.json(await buildBuyTx({ mint: b.mint, buyer: b.buyer, owner: b.owner, maxPrice, currency })); }
+  try {
+    if (config.tensorLocal) {
+      if (!Number.isSafeInteger(maxPrice) || !isSol(currency) || b.owner === b.buyer) {
+        return c.json({ error: "Local buy requires an exact SOL cap and a different buyer." }, 422);
+      }
+      const { listing } = await readCoreTensorMarket(b.mint);
+      if (!listing?.buySupported || listing.owner !== b.owner || BigInt(listing.price) > BigInt(maxPrice)) {
+        return c.json({ error: "The verified SOL listing no longer matches the purchase." }, 409);
+      }
+    }
+    return c.json(await buildBuyTx({ mint: b.mint, buyer: b.buyer, owner: b.owner, maxPrice, currency }));
+  }
   catch (e) { return c.json({ error: String((e as any)?.message ?? e) }, 400); }
 });
 
 app.post("/market/delist", async (c) => {
+  if (config.tensorLocal && !localMarketRequest(c.req.url)) return c.json({ error: "Local market only." }, 403);
   const b = await c.req.json().catch(() => ({}));
   if (!isPubkey(b.mint) || !isPubkey(b.owner)) return c.json({ error: "mint and owner must be base58 pubkeys" }, 400);
-  try { return c.json(await buildDelistTx({ mint: b.mint, owner: b.owner })); }
+  try {
+    if (config.tensorLocal) {
+      const { currentOwner, listing } = await readCoreTensorMarket(b.mint);
+      if (!listing || currentOwner !== listing.order || listing.owner !== b.owner || listing.currency !== "SOL" ||
+          listing.cosigner) {
+        return c.json({ error: "The verified SOL listing or owner changed." }, 409);
+      }
+    }
+    return c.json(await buildDelistTx({ mint: b.mint, owner: b.owner }));
+  }
   catch (e) { return c.json({ error: String((e as any)?.message ?? e) }, 400); }
 });
 
@@ -588,6 +635,6 @@ if (import.meta.main) {
     return null;
   });
   startJobs();
-  Bun.serve({ port: config.port, fetch: app.fetch });
+  Bun.serve({ port: config.port, fetch: app.fetch, ...(config.tensorLocal ? { hostname: "127.0.0.1" } : {}) });
   console.log(`iq-inscription-nft backend on :${config.port} (${config.cluster}, program ${config.programId.toBase58()})`);
 }

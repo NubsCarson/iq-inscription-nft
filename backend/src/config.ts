@@ -45,6 +45,16 @@ const net = networkFor(cluster);
 // RPC is the one coupled value with a secret (mainnet Helius key), so it alone
 // keeps an env override; empty/unset falls back to the preset's public default.
 const rpcOverride = (process.env.RPC_URLS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+const rpcUrls = rpcOverride.length ? rpcOverride : net.rpcUrls;
+const loopback = (url: URL) => url.protocol === "http:" &&
+  ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) &&
+  !url.username && !url.password && !url.search && !url.hash;
+const tensorLocalBase = env("TENSOR_LOCAL_BASE", "");
+if (tensorLocalBase &&
+    (cluster !== "devnet" || !loopback(new URL(tensorLocalBase)) ||
+      !rpcUrls.every(value => loopback(new URL(value))))) {
+  throw new Error("TENSOR_LOCAL_BASE requires a loopback Tensor proxy and loopback RPC in devnet mode");
+}
 
 export const config = {
   port: Number(env("PORT", "8787")),
@@ -58,7 +68,7 @@ export const config = {
   // Primary first. Rotation walks the list on 429/5xx. Never a user-supplied
   // endpoint: a hostile RPC could return a doctored transaction and walk a fake
   // inscription past the verifier. Default from the preset; RPC_URLS overrides.
-  rpcUrls: rpcOverride.length ? rpcOverride : net.rpcUrls,
+  rpcUrls,
 
   // Where the on-chain uri and the metadata image point (a cache over the chain)
   // and the cluster suffix for solscan external_url. Both from the preset so a
@@ -104,7 +114,8 @@ export const config = {
   // devnet host rejects it, so the poller only runs on mainnet. Empty = off.
   // The base host is cluster-keyed in the preset.
   tensorApiKey: env("TENSOR_API_KEY", ""),
-  tensorBase: net.tensorBase,
+  tensorBase: tensorLocalBase ? tensorLocalBase.replace(/\/+$/, "") : net.tensorBase,
+  tensorLocal: Boolean(tensorLocalBase),
   tensorPollMs: Number(env("TENSOR_POLL_MS", "90000")),
 
   // Stock-token (securities) currency, for minting and secondary trades. OFF by
